@@ -6912,7 +6912,8 @@ def perform_onedeploy_webapp(cmd,
                              ignore_stack=None,
                              timeout=None,
                              slot=None,
-                             track_status=True):
+                             track_status=True,
+                             pull_identity=None):
     params = OneDeployParams()
 
     params.cmd = cmd
@@ -6929,6 +6930,7 @@ def perform_onedeploy_webapp(cmd,
     params.timeout = timeout
     params.slot = slot
     params.track_status = track_status
+    params.pull_identity = pull_identity
 
     return _perform_onedeploy_internal(params)
 
@@ -6948,19 +6950,13 @@ class OneDeployParams:
         self.should_restart = None
         self.is_clean_deployment = None
         self.should_ignore_stack = None
+        self.pull_identity = None
         self.timeout = None
         self.slot = None
         self.track_status = False
 # pylint: enable=too-many-instance-attributes,too-few-public-methods
 
-
 def _build_onedeploy_url(params):
-    if params.src_url:
-        return _build_onedeploy_arm_url(params)
-    return _build_onedeploy_scm_url(params)
-
-
-def _build_onedeploy_scm_url(params):
     scm_url = _get_scm_url(params.cmd, params.resource_group_name, params.webapp_name, params.slot)
     deploy_url = scm_url + '/api/publish?type=' + params.artifact_type
 
@@ -6980,24 +6976,6 @@ def _build_onedeploy_scm_url(params):
         deploy_url = deploy_url + '&path=' + params.target_path
 
     return deploy_url
-
-
-def _build_onedeploy_arm_url(params):
-    from azure.cli.core.commands.client_factory import get_subscription_id
-    client = web_client_factory(params.cmd.cli_ctx)
-    sub_id = get_subscription_id(params.cmd.cli_ctx)
-    if not params.slot:
-        base_url = (
-            f"subscriptions/{sub_id}/resourceGroups/{params.resource_group_name}/providers/Microsoft.Web/sites/"
-            f"{params.webapp_name}/extensions/onedeploy?api-version={client.DEFAULT_API_VERSION}"
-        )
-    else:
-        base_url = (
-            f"subscriptions/{sub_id}/resourceGroups/{params.resource_group_name}/providers/Microsoft.Web/sites/"
-            f"{params.webapp_name}/slots/{params.slot}/extensions/onedeploy"
-            f"?api-version={client.DEFAULT_API_VERSION}"
-        )
-    return params.cmd.cli_ctx.cloud.endpoints.resource_manager + base_url
 
 
 def _build_deploymentstatus_url(cmd, resource_group_name, webapp_name, slot, deployment_id):
@@ -7056,18 +7034,19 @@ def _get_onedeploy_request_body(params):
                                         "access it".format(params.src_path)) from e
     elif params.src_url:
         logger.warning('Deploying from URL: %s', params.src_url)
+
+        if app_is_linux_webapp and params.pull_identity is not None:
+            logger.warning('Pull with MSI support comming soon for Linux webapps')
+            raise ValidationError("Pull with MSI support is not available for Linux webapps")
+
         body = {
-            "properties": {
-                "packageUri": params.src_url,
-                "type": params.artifact_type,
-                "path": params.target_path,
-                "ignorestack": params.should_ignore_stack,
-                "clean": params.is_clean_deployment,
-                "restart": params.should_restart,
-            }
+            "packageUri": params.src_url,
+            "pullIdentity": params.pull_identity                                                                                                                                                                                                                                 
         }
-        body = {"properties": {k: v for k, v in body["properties"].items() if v is not None}}
+
         body = json.dumps(body)
+
+        logger.debug('Request body: %s', body)
     else:
         raise ResourceNotFoundError('Unable to determine source location of the artifact being deployed')
 
@@ -7109,12 +7088,8 @@ def _make_onedeploy_request(params):
     # For debugging purposes only, you can change the async deployment into a sync deployment by polling the API status
     # For that, set poll_async_deployment_for_debugging=True
     logger.info("Deployment API: %s", deploy_url)
-    if not params.src_url:  # use SCM endpoint
-        response = requests.post(deploy_url, data=body, headers=headers, verify=not should_disable_connection_verify())
-        poll_async_deployment_for_debugging = True
-    else:
-        response = send_raw_request(params.cmd.cli_ctx, "PUT", deploy_url, body=body)
-        poll_async_deployment_for_debugging = False
+    response = requests.post(deploy_url, data=body, headers=headers, verify=not should_disable_connection_verify())
+    poll_async_deployment_for_debugging = True
 
     # check the status of deployment
     # pylint: disable=too-many-nested-blocks
